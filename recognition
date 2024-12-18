@@ -1,0 +1,157 @@
+import cv2
+import threading
+import time
+import face_recognition
+import os
+import numpy as np
+import csv
+from datetime import datetime
+
+# Load the pre-trained Haar Cascade for face detection
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+# Open the video capture (0 = default camera)
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FPS, 30)  # Set FPS for smooth video
+
+if not cap.isOpened():
+    print("Error: Could not open the camera.")
+    exit()
+
+cv2.namedWindow("Face Detection and Recognition", cv2.WINDOW_NORMAL)
+
+print("Press 'q' to quit the application.")
+
+# Shared variables for the detection thread
+frame_for_detection = None
+detection_results = None
+detection_lock = threading.Lock()
+stop_thread = False
+
+# Load known faces and their names
+known_face_encodings = []
+known_face_names = []
+known_faces_dir = "known_faces/"
+
+# Create a directory to save CSV if not exists
+output_dir = "Attendance Time"
+os.makedirs(output_dir, exist_ok=True)
+output_file = os.path.join(output_dir, "recognized_faces.csv")
+
+# Initialize CSV file
+if not os.path.exists(output_file):
+    with open(output_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Timestamp", "Name"])
+
+# Load known face images from subfolders
+for person_name in os.listdir(known_faces_dir):
+    person_dir = os.path.join(known_faces_dir, person_name)
+    if os.path.isdir(person_dir):  # Check if it is a directory
+        for filename in os.listdir(person_dir):
+            image_path = os.path.join(person_dir, filename)
+            try:
+                image = face_recognition.load_image_file(image_path)
+                encoding = face_recognition.face_encodings(image)[0]  # Encode the face
+                known_face_encodings.append(encoding)
+                known_face_names.append(person_name)  # Use the folder name as the person's name
+            except Exception as e:
+                print(f"Error processing file {image_path}: {e}")
+
+def face_detection_thread():
+    """Thread function to perform face detection and recognition."""
+    global frame_for_detection, detection_results, stop_thread
+    last_logged = {}  # Dictionary to track the last logged time for each name
+
+    while not stop_thread:
+        if frame_for_detection is not None:
+            with detection_lock:
+                frame = frame_for_detection.copy()
+
+            # Convert to grayscale for Haar Cascade
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Detect faces using Haar Cascade
+            haar_faces = face_cascade.detectMultiScale(
+                gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
+            )
+
+            recognized_faces = []
+
+            # For each detected face, use face_recognition for recognition
+            for (x, y, w, h) in haar_faces:
+                # Extract the face region of interest (ROI)
+                face_roi = frame[y:y+h, x:x+w]
+
+                # Convert ROI to RGB (required for face_recognition)
+                rgb_face_roi = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
+
+                # Detect and encode the face in the ROI
+                face_encodings = face_recognition.face_encodings(rgb_face_roi)
+
+                name = "Unknown"
+                if face_encodings:
+                    # Compare with known faces
+                    face_encoding = face_encodings[0]
+                    matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
+                    face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                    best_match_index = np.argmin(face_distances) if len(face_distances) > 0 else None
+
+                    if best_match_index is not None and matches[best_match_index]:
+                        name = known_face_names[best_match_index]
+
+                    # Check delay for logging
+                    current_time = time.time()
+                    if name not in last_logged or current_time - last_logged[name] > 5:  # 1-second delay
+                        # Save to CSV
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        with open(output_file, mode='a', newline='') as file:
+                            writer = csv.writer(file)
+                            writer.writerow([timestamp, name])
+
+                        # Print to terminal
+                        print(f"Recognized: {name} at {timestamp}")
+
+                        # Update the last logged time
+                        last_logged[name] = current_time
+
+                recognized_faces.append((x, y, x+w, y+h, name))
+
+            with detection_lock:
+                detection_results = recognized_faces
+
+        time.sleep(1 / 24)  # Run detection 24 times per second
+
+# Start the detection thread
+thread = threading.Thread(target=face_detection_thread)
+thread.start()
+
+while 0xFF != ord('q'):
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Could not read the frame.")
+        break
+
+    with detection_lock:
+        frame_for_detection = frame.copy()
+
+    # Draw detection results on the frame
+    with detection_lock:
+        if detection_results is not None:
+            for (left, top, right, bottom, name) in detection_results:
+                # Draw rectangle and label the detected face
+                cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                cv2.putText(frame, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+
+    # Display the frame
+    cv2.imshow("Face Detection and Recognition", frame)
+
+    # Exit the loop if 'q' is pressed
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        print("Exiting...")
+        stop_thread = True
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+thread.join()
